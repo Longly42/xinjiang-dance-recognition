@@ -34,17 +34,13 @@ wheels/
 *.ckpt
 *.onnx
 *.h5
-model/
-models/
 
 # 数据集、日志、临时文件
-data/
 datasets/
 logs/
 *.log
 *.tmp
 *.temp
-capture/
 
 # IDE / 编辑器
 .idea/
