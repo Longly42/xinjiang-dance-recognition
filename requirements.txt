@@ -1,0 +1,26 @@
+# 基础环境
+python==3.9.0
+
+# 数据处理与数值计算
+numpy>=1.21.0
+pandas>=1.3.0
+
+# 视频/图像处理
+opencv-python>=4.5.0
+Pillow>=8.3.0
+
+# 深度学习/模型相关
+torch>=1.10.0
+torchvision>=0.11.0
+
+# 人体姿态识别（按你项目用的库来选，这里给常用的）
+mediapipe>=0.8.9
+# 或 opencv-contrib-python>=4.5.0
+
+# GUI界面（PyQt5）
+PyQt5>=5.15.0
+PyQt5-tools>=5.15.0
+
+# 日志/工具类（可选）
+tqdm>=4.62.0
+pyyaml>=5.4.0
