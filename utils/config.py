@@ -1,27 +1,32 @@
 """
-配置文件 - 与B组约定的所有常量
-冻结时间点：2026年5月11日（之后不再修改格式）
+配置文件 - 性能优化版
 """
 
+import os
+
 # ==================== 输入输出约定 ====================
-INPUT_SIZE = (640, 480)          # 输入尺寸 (宽, 高)
-SEQUENCE_LENGTH = 16             # 时序长度（连续帧数）
-FPS_TARGET = 30                  # 目标采集帧率
+# 优化：降低输入尺寸，提升帧率
+INPUT_SIZE = (480, 360)          # 原 (640, 480)，计算量减少约 44%
+SEQUENCE_LENGTH = 16             # 时序长度（不变）
+FPS_TARGET = 20                  # 目标采集帧率（原30）
 
-# ==================== 骨架关键点（MediaPipe Pose = 33点）====================
-NUM_KEYPOINTS = 33               # MediaPipe Pose 关键点数量
-KEYPOINT_FEATURE_DIM = 3         # 每个关键点的特征维度 (x, y, visibility)
+# 性能优化参数
+USE_FAST_RESIZE = True           # 使用快速缩放
+FRAME_SKIP = 1                   # 跳帧数（1=不跳帧，2=每2帧处理1帧）
+ASYNC_INFERENCE = True           # 异步推理（不阻塞采集）
+CACHE_COLOR_CONVERSION = True    # 缓存颜色转换结果
 
-# ==================== 标签映射（与B组共同敲定）====================
+# ==================== 骨架关键点 ====================
+NUM_KEYPOINTS = 33
+KEYPOINT_FEATURE_DIM = 3
 
-# TODO: 等B组确定具体类别后填入
+# ==================== 标签映射 ====================
 ACTION_LABELS = {
     0: "旋转",
     1: "翻腕", 
     2: "移颈",
     3: "跺步",
     4: "蹲起",
-    # 待补充...
 }
 
 STYLE_LABELS = {
@@ -29,8 +34,24 @@ STYLE_LABELS = {
     1: "木卡姆",
     2: "赛乃姆",
     3: "萨玛舞",
-
-    
-    # 待补充...
 }
 
+# ==================== 数据路径 ====================
+DATA_ROOT = "./data"
+RECORDING_DIR = os.path.join(DATA_ROOT, "recordings")
+SLICED_DIR = os.path.join(DATA_ROOT, "sliced_clips")
+KEYPOINTS_DIR = os.path.join(DATA_ROOT, "keypoints")
+MODEL_DIR = os.path.join(DATA_ROOT, "models")
+
+# 切片参数
+SLICE_WINDOW_SEC = 2
+SLICE_STEP_SEC = 1
+
+# 训练参数
+BATCH_SIZE = 32
+EPOCHS = 50
+LEARNING_RATE = 0.001
+
+# 创建目录
+for dir_path in [RECORDING_DIR, SLICED_DIR, KEYPOINTS_DIR, MODEL_DIR]:
+    os.makedirs(dir_path, exist_ok=True)
