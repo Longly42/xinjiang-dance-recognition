@@ -52,3 +52,6 @@ logs/
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 忽视所有 mp4 视频文件
+*.mp4
