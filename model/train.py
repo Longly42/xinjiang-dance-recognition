@@ -1,240 +1,186 @@
 """
-train.py - 模型训练脚本
+train.py – 训练双任务 ST-GCN，支持早停、学习率调度、模型保存和评估
 """
 
+import os
+import sys
+import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.optim.lr_scheduler import StepLR
 import numpy as np
 from tqdm import tqdm
-import os
 import matplotlib.pyplot as plt
 
-from model.action_model import DanceRecognitionModel, save_model
-from utils.config import (
-    EPOCHS, BATCH_SIZE, LEARNING_RATE, MODEL_DIR,
-    KEYPOINTS_DIR,  # 添加这一行
-    ACTION_LABELS, STYLE_LABELS
+from .config import (
+    BATCH_SIZE, EPOCHS, LEARNING_RATE, WEIGHT_DECAY,
+    LR_SCHEDULER_STEP, LR_SCHEDULER_GAMMA,
+    PATIENCE, USE_CLASS_WEIGHTS, MODEL_SAVE_PATH,
+    NUM_ACTIONS, NUM_STYLES, KEYPOINTS_DIR
 )
-class Trainer:
-    """训练器"""
-    
-    def __init__(self, model, device='cuda' if torch.cuda.is_available() else 'cpu'):
-        self.model = model.to(device)
-        self.device = device
-        
-        # 双任务损失函数
-        self.action_criterion = nn.CrossEntropyLoss()
-        self.style_criterion = nn.CrossEntropyLoss()
-        
-        # 优化器
-        self.optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
-        
-        # 学习率调度器
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.5, patience=5, verbose=True
-        )
-        
-        self.train_losses = []
-        self.val_losses = []
-        self.train_accs = []
-        self.val_accs = []
-    
-    def train_epoch(self, train_loader):
-        """训练一个 epoch"""
-        self.model.train()
-        total_loss = 0
-        correct_action = 0
-        correct_style = 0
-        total = 0
-        
-        for X, y_action, y_style in tqdm(train_loader, desc="训练"):
-            X = X.to(self.device)
-            y_action = y_action.to(self.device)
-            y_style = y_style.to(self.device)
-            
-            # 前向传播
-            action_logits, style_logits = self.model(X)
-            
-            # 计算损失
-            action_loss = self.action_criterion(action_logits, y_action)
-            style_loss = self.style_criterion(style_logits, y_style)
-            loss = action_loss + style_loss
-            
-            # 反向传播
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            
-            # 统计
+from .dataset import build_dataloaders
+from .stgcn import DualTaskSTGCN
+from .utils import plot_confusion_matrix, plot_training_curves
+
+
+def train_one_epoch(model, loader, optimizer, criterion_action, criterion_style, device):
+    model.train()
+    total_loss = 0
+    total_action_loss = 0
+    total_style_loss = 0
+    action_acc = 0
+    style_acc = 0
+    count = 0
+
+    for x, y_action, y_style in tqdm(loader, desc="Training", leave=False):
+        x, y_action, y_style = x.to(device), y_action.to(device), y_style.to(device)
+        optimizer.zero_grad()
+
+        action_logits, style_logits = model(x)
+
+        loss_a = criterion_action(action_logits, y_action)
+        loss_s = criterion_style(style_logits, y_style)
+        loss = loss_a + loss_s
+
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        total_action_loss += loss_a.item()
+        total_style_loss += loss_s.item()
+
+        pred_a = torch.argmax(action_logits, dim=1)
+        pred_s = torch.argmax(style_logits, dim=1)
+        action_acc += (pred_a == y_action).sum().item()
+        style_acc += (pred_s == y_style).sum().item()
+        count += x.size(0)
+
+    return (total_loss / len(loader),
+            total_action_loss / len(loader),
+            total_style_loss / len(loader),
+            action_acc / count,
+            style_acc / count)
+
+
+def evaluate(model, loader, criterion_action, criterion_style, device):
+    model.eval()
+    total_loss = 0
+    action_acc = 0
+    style_acc = 0
+    count = 0
+
+    with torch.no_grad():
+        for x, y_action, y_style in tqdm(loader, desc="Evaluating", leave=False):
+            x, y_action, y_style = x.to(device), y_action.to(device), y_style.to(device)
+            action_logits, style_logits = model(x)
+            loss = criterion_action(action_logits, y_action) + criterion_style(style_logits, y_style)
             total_loss += loss.item()
-            _, action_pred = torch.max(action_logits, 1)
-            _, style_pred = torch.max(style_logits, 1)
-            total += y_action.size(0)
-            correct_action += (action_pred == y_action).sum().item()
-            correct_style += (style_pred == y_style).sum().item()
-        
-        avg_loss = total_loss / len(train_loader)
-        action_acc = correct_action / total
-        style_acc = correct_style / total
-        
-        return avg_loss, action_acc, style_acc
-    
-    def validate(self, val_loader):
-        """验证"""
-        self.model.eval()
-        total_loss = 0
-        correct_action = 0
-        correct_style = 0
-        total = 0
-        
-        with torch.no_grad():
-            for X, y_action, y_style in tqdm(val_loader, desc="验证"):
-                X = X.to(self.device)
-                y_action = y_action.to(self.device)
-                y_style = y_style.to(self.device)
-                
-                action_logits, style_logits = self.model(X)
-                
-                action_loss = self.action_criterion(action_logits, y_action)
-                style_loss = self.style_criterion(style_logits, y_style)
-                loss = action_loss + style_loss
-                
-                total_loss += loss.item()
-                _, action_pred = torch.max(action_logits, 1)
-                _, style_pred = torch.max(style_logits, 1)
-                total += y_action.size(0)
-                correct_action += (action_pred == y_action).sum().item()
-                correct_style += (style_pred == y_style).sum().item()
-        
-        avg_loss = total_loss / len(val_loader)
-        action_acc = correct_action / total
-        style_acc = correct_style / total
-        
-        return avg_loss, action_acc, style_acc
-    
-    def train(self, train_loader, val_loader, epochs=EPOCHS):
-        """完整训练流程"""
-        best_val_acc = 0
-        
-        for epoch in range(epochs):
-            print(f"\nEpoch {epoch+1}/{epochs}")
-            
-            # 训练
-            train_loss, train_action_acc, train_style_acc = self.train_epoch(train_loader)
-            
-            # 验证
-            val_loss, val_action_acc, val_style_acc = self.validate(val_loader)
-            
-            # 记录
-            self.train_losses.append(train_loss)
-            self.val_losses.append(val_loss)
-            self.train_accs.append((train_action_acc + train_style_acc) / 2)
-            self.val_accs.append((val_action_acc + val_style_acc) / 2)
-            
-            # 打印
-            print(f"训练 - Loss: {train_loss:.4f}, 动作准确率: {train_action_acc:.4f}, 风格准确率: {train_style_acc:.4f}")
-            print(f"验证 - Loss: {val_loss:.4f}, 动作准确率: {val_action_acc:.4f}, 风格准确率: {val_style_acc:.4f}")
-            
-            # 学习率调度
-            self.scheduler.step(val_loss)
-            
-            # 保存最佳模型
-            avg_val_acc = (val_action_acc + val_style_acc) / 2
-            if avg_val_acc > best_val_acc:
-                best_val_acc = avg_val_acc
-                save_model(self.model, os.path.join(MODEL_DIR, 'best_model.pth'))
-                print(f"保存最佳模型，准确率: {best_val_acc:.4f}")
-        
-        # 绘制训练曲线
-        self.plot_curves()
-        
-        return best_val_acc
-    
-    def plot_curves(self):
-        """绘制训练曲线"""
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-        
-        # 损失曲线
-        axes[0].plot(self.train_losses, label='训练损失')
-        axes[0].plot(self.val_losses, label='验证损失')
-        axes[0].set_xlabel('Epoch')
-        axes[0].set_ylabel('Loss')
-        axes[0].set_title('训练曲线')
-        axes[0].legend()
-        axes[0].grid(True)
-        
-        # 准确率曲线
-        axes[1].plot(self.train_accs, label='训练准确率')
-        axes[1].plot(self.val_accs, label='验证准确率')
-        axes[1].set_xlabel('Epoch')
-        axes[1].set_ylabel('Accuracy')
-        axes[1].set_title('准确率曲线')
-        axes[1].legend()
-        axes[1].grid(True)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(MODEL_DIR, 'training_curves.png'))
-        plt.show()
+
+            pred_a = torch.argmax(action_logits, dim=1)
+            pred_s = torch.argmax(style_logits, dim=1)
+            action_acc += (pred_a == y_action).sum().item()
+            style_acc += (pred_s == y_style).sum().item()
+            count += x.size(0)
+
+    return total_loss / len(loader), action_acc / count, style_acc / count
 
 
-def load_data(npz_path):
-    """加载预处理的数据集"""
+def get_class_weights(npz_path):
+    """从数据集分布计算类别权重，用于损失函数"""
     data = np.load(npz_path)
-    X = data['X']
     y_action = data['y_action']
     y_style = data['y_style']
-    
-    # 转换为 PyTorch Tensor
-    X = torch.FloatTensor(X)
-    y_action = torch.LongTensor(y_action)
-    y_style = torch.LongTensor(y_style)
-    
-    return X, y_action, y_style
+
+    action_counts = np.bincount(y_action, minlength=NUM_ACTIONS)
+    style_counts = np.bincount(y_style, minlength=NUM_STYLES)
+
+    action_weights = 1.0 / (action_counts + 1e-6)
+    action_weights = action_weights / action_weights.sum() * NUM_ACTIONS
+
+    style_weights = 1.0 / (style_counts + 1e-6)
+    style_weights = style_weights / style_weights.sum() * NUM_STYLES
+
+    return torch.tensor(action_weights, dtype=torch.float), torch.tensor(style_weights, dtype=torch.float)
 
 
-def main():
-    """主训练函数"""
-    # 加载数据
-    dataset_path = os.path.join(KEYPOINTS_DIR, 'dataset.npz')
-    if not os.path.exists(dataset_path):
-        print(f"[ERROR] 数据集不存在: {dataset_path}")
-        print("请先运行 DatasetBuilder 构建数据集")
+def train_main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    npz_path = os.path.join(KEYPOINTS_DIR, "dataset.npz")
+    if not os.path.exists(npz_path):
+        print(f"错误: 未找到数据集文件 {npz_path}")
+        print("请先运行 scripts/extract_keypoints.py 生成骨架数据")
         return
-    
-    X, y_action, y_style = load_data(dataset_path)
-    
-    # 划分训练集和验证集
-    num_samples = len(X)
-    num_train = int(0.8 * num_samples)
-    indices = np.random.permutation(num_samples)
-    train_idx = indices[:num_train]
-    val_idx = indices[num_train:]
-    
-    X_train, y_action_train, y_style_train = X[train_idx], y_action[train_idx], y_style[train_idx]
-    X_val, y_action_val, y_style_val = X[val_idx], y_action[val_idx], y_style[val_idx]
-    
-    # 创建 DataLoader
-    train_dataset = TensorDataset(X_train, y_action_train, y_style_train)
-    val_dataset = TensorDataset(X_val, y_action_val, y_style_val)
-    
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    
-    # 创建模型
-    from utils.config import ACTION_LABELS, STYLE_LABELS
-    model = DanceRecognitionModel(
-        num_actions=len(ACTION_LABELS),
-        num_styles=len(STYLE_LABELS)
-    )
-    
-    # 训练
-    trainer = Trainer(model)
-    best_acc = trainer.train(train_loader, val_loader)
-    
-    print(f"\n训练完成！最佳验证准确率: {best_acc:.4f}")
+
+    # 类别权重
+    if USE_CLASS_WEIGHTS:
+        action_weights, style_weights = get_class_weights(npz_path)
+        action_weights = action_weights.to(device)
+        style_weights = style_weights.to(device)
+        criterion_action = nn.CrossEntropyLoss(weight=action_weights)
+        criterion_style = nn.CrossEntropyLoss(weight=style_weights)
+    else:
+        criterion_action = nn.CrossEntropyLoss()
+        criterion_style = nn.CrossEntropyLoss()
+
+    # 数据加载
+    train_loader, val_loader, test_loader = build_dataloaders(npz_path, BATCH_SIZE)
+
+    model = DualTaskSTGCN().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = StepLR(optimizer, step_size=LR_SCHEDULER_STEP, gamma=LR_SCHEDULER_GAMMA)
+
+    best_val_loss = float('inf')
+    patience_counter = 0
+    train_losses, val_losses = [], []
+    train_acc_a, val_acc_a = [], []
+    train_acc_s, val_acc_s = [], []
+
+    for epoch in range(1, EPOCHS+1):
+        print(f"\nEpoch {epoch}/{EPOCHS}")
+        train_loss, train_loss_a, train_loss_s, train_acc_a_ep, train_acc_s_ep = train_one_epoch(
+            model, train_loader, optimizer, criterion_action, criterion_style, device)
+        val_loss, val_acc_a_ep, val_acc_s_ep = evaluate(model, val_loader, criterion_action, criterion_style, device)
+        scheduler.step()
+
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        train_acc_a.append(train_acc_a_ep)
+        val_acc_a.append(val_acc_a_ep)
+        train_acc_s.append(train_acc_s_ep)
+        val_acc_s.append(val_acc_s_ep)
+
+        print(f"Train Loss: {train_loss:.4f} (A:{train_loss_a:.4f} S:{train_loss_s:.4f}) | Acc A: {train_acc_a_ep:.4f} S: {train_acc_s_ep:.4f}")
+        print(f"Val   Loss: {val_loss:.4f} | Acc A: {val_acc_a_ep:.4f} S: {val_acc_s_ep:.4f}")
+
+        # 早停 & 保存最佳模型
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), MODEL_SAVE_PATH)
+            print(f"  -> 保存最佳模型到 {MODEL_SAVE_PATH}")
+        else:
+            patience_counter += 1
+            if patience_counter >= PATIENCE:
+                print(f"早停触发，停止训练")
+                break
+
+    # 加载最佳模型进行测试
+    model.load_state_dict(torch.load(MODEL_SAVE_PATH))
+    test_loss, test_acc_a, test_acc_s = evaluate(model, test_loader, criterion_action, criterion_style, device)
+    print(f"\n测试集结果: Loss={test_loss:.4f}, Action Acc={test_acc_a:.4f}, Style Acc={test_acc_s:.4f}")
+
+    # 绘制混淆矩阵
+    from .utils import save_confusion_matrices
+    save_confusion_matrices(model, test_loader, device, save_dir=KEYPOINTS_DIR)
+
+    # 绘制训练曲线
+    plot_training_curves(train_losses, val_losses, train_acc_a, val_acc_a, train_acc_s, val_acc_s, save_dir=KEYPOINTS_DIR)
+
+    print("训练完成！")
 
 
 if __name__ == "__main__":
-    main()
+    train_main()

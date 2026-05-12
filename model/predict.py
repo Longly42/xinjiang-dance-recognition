@@ -1,141 +1,99 @@
 """
-predict.py - 推理接口封装
-供 A 组调用的统一接口
+predict.py – 封装模型加载和实时推理，供 GUI 的 CaptureThread 调用
 """
 
 import torch
+import torch.nn.functional as F
 import numpy as np
-from typing import Tuple, List, Optional
+import json
+import os
+from typing import Tuple
 
-from model.action_model import load_model
-from model.pose_extract import get_pose_extractor
-from utils.config import (
-    ACTION_LABELS, STYLE_LABELS, 
-    SEQUENCE_LENGTH, INPUT_SIZE
+from .config import (
+    MODEL_SAVE_PATH, LABEL_MAP_PATH,
+    SEQUENCE_LENGTH, NUM_KEYPOINTS, KEYPOINT_FEATURE_DIM,
+    NUM_ACTIONS, NUM_STYLES, INFERENCE_CONFIDENCE_THRESHOLD
 )
-import cv2
+from .stgcn import DualTaskSTGCN
 
 
-class DanceRecognizer:
-    """舞蹈识别器（单例）"""
-    
-    _instance = None
-    
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
-    
-    def __init__(self):
-        if self._initialized:
-            return
-        
-        self.model = None
-        self.pose_extractor = get_pose_extractor()
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self._load_model()
-        self.frame_buffer = []  # 帧缓存
-        self._initialized = True
-    
-    def _load_model(self):
-        """加载模型"""
-        import os
-        from utils.config import MODEL_DIR
-        
-        model_path = os.path.join(MODEL_DIR, 'best_model.pth')
-        
+class Recognizer:
+    """推理识别器，负责加载模型、预处理输入帧、执行推理"""
+    def __init__(self, model_path: str = MODEL_SAVE_PATH, label_map_path: str = LABEL_MAP_PATH):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = DualTaskSTGCN().to(self.device)
+
         if os.path.exists(model_path):
-            try:
-                self.model = load_model(model_path, self.device)
-                print(f"[INFO] 模型加载成功: {model_path}")
-            except Exception as e:
-                print(f"[ERROR] 模型加载失败: {e}")
-                self.model = None
+            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+            print(f"[Recognizer] 加载模型成功: {model_path}")
         else:
-            print(f"[WARN] 模型文件不存在，使用 Mock 模式: {model_path}")
-            self.model = None
-    
-    def predict_from_frames(self, frames: List[np.ndarray]) -> Tuple[str, str, float]:
+            print(f"[Recognizer] 未找到模型文件 {model_path}，将使用随机权重（演示模式）")
+        self.model.eval()
+
+        # 加载标签映射
+        self.action_names = [f"动作{i}" for i in range(NUM_ACTIONS)]
+        self.style_names = [f"风格{i}" for i in range(NUM_STYLES)]
+        if os.path.exists(label_map_path):
+            with open(label_map_path, 'r', encoding='utf-8') as f:
+                label_map = json.load(f)
+                # 假设格式: {"action": {"0":"旋转", ...}, "style": {"0":"赛乃姆",...}}
+                self.action_names = [label_map["action"][str(i)] for i in range(NUM_ACTIONS)]
+                self.style_names = [label_map["style"][str(i)] for i in range(NUM_STYLES)]
+
+    def _preprocess_frames(self, frames: np.ndarray) -> torch.Tensor:
         """
-        从帧列表进行推理（A 组调用此接口）
-        :param frames: RGB 图像列表，长度至少为 SEQUENCE_LENGTH
-        :return: (动作标签, 风格标签, 置信度)
+        frames: 形状 (T, H, W, 3) 的 RGB 图像列表（T=SEQUENCE_LENGTH）
+        需先经过 PoseExtractor 提取骨架，但此处为了简化，直接要求输入骨架数据。
+        实际 GUI 流程：
+        CaptureThread 缓存 RGB 帧 -> 调用 PoseExtractor 提取骨架 -> 调用此预测方法。
+        本方法直接处理骨架序列。
         """
-        if len(frames) < SEQUENCE_LENGTH:
-            return "等待更多帧", "等待更多帧", 0.0
-        
-        # 提取骨架
-        poses = self._extract_poses_from_frames(frames[-SEQUENCE_LENGTH:])
-        
-        if poses is None:
-            return "未检测到人体", "未知", 0.0
-        
-        # 推理
-        if self.model is not None:
-            action_label, style_label, action_conf, style_conf = self._predict_with_model(poses)
-            # 使用动作和风格置信度的平均值作为整体置信度
-            confidence = (action_conf + style_conf) / 2
-        else:
-            # Mock 推理
-            action_label, style_label, confidence = self._predict_mock(poses)
-        
-        # 转换为标签名称
-        action_name = ACTION_LABELS.get(action_label, f"动作{action_label}")
-        style_name = STYLE_LABELS.get(style_label, f"风格{style_label}")
-        
-        return action_name, style_name, confidence
-    
-    def _extract_poses_from_frames(self, frames: List[np.ndarray]) -> Optional[np.ndarray]:
-        """从帧列表提取骨架序列"""
-        poses = self.pose_extractor.extract_sequence(frames)
-        
-        if poses is None or len(poses) < SEQUENCE_LENGTH:
-            return None
-        
-        # 确保序列长度一致
-        if len(poses) > SEQUENCE_LENGTH:
-            indices = np.linspace(0, len(poses)-1, SEQUENCE_LENGTH, dtype=int)
-            poses = poses[indices]
-        
-        return poses
-    
-    def _predict_with_model(self, poses: np.ndarray) -> Tuple[int, int, float, float]:
-        """使用模型推理"""
-        # 转换为 Tensor
-        poses_tensor = torch.FloatTensor(poses).unsqueeze(0).to(self.device)
-        
+        # 假定 frames 已经是 (T, V, C) 的骨架数组
+        if frames.ndim == 3:
+            frames = frames[np.newaxis, ...]  # (1, T, V, C)
+        # 转换为 (C, T, V) 格式
+        tensor = torch.from_numpy(frames).float().permute(0, 3, 1, 2).to(self.device)  # (N, C, T, V)
+        return tensor
+
+    def predict_from_poses(self, poses: np.ndarray) -> Tuple[str, str, float]:
+        """
+        输入：(T, V, C) 骨架序列
+        输出：(动作名称, 风格名称, 置信度（最大 softmax 概率）)
+        """
+        if poses.shape[0] < SEQUENCE_LENGTH:
+            # 帧数不足，返回默认值
+            return "检测中", "检测中", 0.0
+
+        # 取最后 SEQUENCE_LENGTH 帧
+        poses = poses[-SEQUENCE_LENGTH:]
+        tensor = self._preprocess_frames(poses)
+
         with torch.no_grad():
-            action_logits, style_logits = self.model(poses_tensor)
-            action_probs = torch.softmax(action_logits, dim=1)
-            style_probs = torch.softmax(style_logits, dim=1)
-            
-            action_label = torch.argmax(action_probs, dim=1).item()
-            style_label = torch.argmax(style_probs, dim=1).item()
-            action_conf = torch.max(action_probs, dim=1)[0].item()
-            style_conf = torch.max(style_probs, dim=1)[0].item()
-        
-        return action_label, style_label, action_conf, style_conf
-    
-    def _predict_mock(self, poses: np.ndarray) -> Tuple[int, int, float]:
-        """Mock 推理（用于测试）"""
-        import random
-        action_label = random.randint(0, len(ACTION_LABELS) - 1)
-        style_label = random.randint(0, len(STYLE_LABELS) - 1)
-        confidence = 0.5 + random.random() * 0.4
-        return action_label, style_label, confidence
-    
-    def reset(self):
-        """重置状态"""
-        self.frame_buffer.clear()
+            action_logits, style_logits = self.model(tensor)
+            action_prob = F.softmax(action_logits, dim=1)[0]
+            style_prob = F.softmax(style_logits, dim=1)[0]
+
+        action_id = torch.argmax(action_prob).item()
+        style_id = torch.argmax(style_prob).item()
+        confidence = max(action_prob.max().item(), style_prob.max().item())
+
+        action_name = self.action_names[action_id]
+        style_name = self.style_names[style_id]
+
+        return action_name, style_name, confidence
+
+    def predict_from_frames(self, frames_rgb_list: list) -> Tuple[str, str, float]:
+        """
+        直接接收 RGB 帧列表（需先提取骨架）
+        实际中，GUI 会调用 PoseExtractor 提取后调用 predict_from_poses。
+        此接口仅用于兼容原有 thread_tools 调用方式。
+        """
+        # 这里期望 frames_rgb_list 已经是提取好的骨架（为了兼容 Mock 方式）
+        # 如果传入的是图像，需要先提取骨架，但会导致循环依赖。建议保持统一：
+        # GUI 线程维护 FrameProcessor 和 PoseExtractor，推理时传递骨架数据。
+        raise NotImplementedError("请先通过 PoseExtractor 提取骨架，再调用 predict_from_poses")
 
 
-# 全局单例
-_recognizer = None
-
-def get_recognizer() -> DanceRecognizer:
-    """获取全局识别器实例"""
-    global _recognizer
-    if _recognizer is None:
-        _recognizer = DanceRecognizer()
-    return _recognizer
+def get_recognizer() -> Recognizer:
+    """工厂函数，供 GUI 调用"""
+    return Recognizer()

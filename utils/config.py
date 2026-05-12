@@ -20,21 +20,8 @@ CACHE_COLOR_CONVERSION = True    # 缓存颜色转换结果
 NUM_KEYPOINTS = 33
 KEYPOINT_FEATURE_DIM = 3
 
-# ==================== 标签映射 ====================
-ACTION_LABELS = {
-    0: "旋转",
-    1: "翻腕", 
-    2: "移颈",
-    3: "跺步",
-    4: "蹲起",
-}
-
-STYLE_LABELS = {
-    0: "刀郎",
-    1: "木卡姆",
-    2: "赛乃姆",
-    3: "萨玛舞",
-}
+# ==================== 标签映射已移至 data/keypoints/label_map.json ====================
+# 不再在代码中硬编码，统一从 JSON 文件读取
 
 # ==================== 数据路径 ====================
 DATA_ROOT = "./data"
@@ -42,6 +29,9 @@ RECORDING_DIR = os.path.join(DATA_ROOT, "recordings")
 SLICED_DIR = os.path.join(DATA_ROOT, "sliced_clips")
 KEYPOINTS_DIR = os.path.join(DATA_ROOT, "keypoints")
 MODEL_DIR = os.path.join(DATA_ROOT, "models")
+
+# 标签映射文件路径
+LABEL_MAP_PATH = os.path.join(KEYPOINTS_DIR, "label_map.json")
 
 # 切片参数
 SLICE_WINDOW_SEC = 2
