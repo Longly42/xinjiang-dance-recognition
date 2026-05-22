@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import confusion_matrix
 import os
+import json  # 添加这个导入
 
 
 def plot_confusion_matrix(y_true, y_pred, labels, title, save_path):
@@ -40,10 +41,21 @@ def save_confusion_matrices(model, dataloader, device, save_dir):
             all_style_true.extend(y_style.cpu().numpy())
             all_style_pred.extend(style_pred.cpu().numpy())
 
-    # 加载标签名（需要从全局获取，这里简单使用数字标签）
-    from .config import NUM_ACTIONS, NUM_STYLES
+    # 从 label_map.json 加载实际标签名称
+    from .config import LABEL_MAP_PATH, NUM_ACTIONS, NUM_STYLES
+    
     action_labels = [f"动作{i}" for i in range(NUM_ACTIONS)]
     style_labels = [f"风格{i}" for i in range(NUM_STYLES)]
+    
+    if os.path.exists(LABEL_MAP_PATH):
+        try:
+            with open(LABEL_MAP_PATH, 'r', encoding='utf-8') as f:
+                label_map = json.load(f)
+            action_labels = [label_map["action"][str(i)] for i in range(NUM_ACTIONS)]
+            style_labels = [label_map["style"][str(i)] for i in range(NUM_STYLES)]
+            print(f"[Utils] 加载标签: 动作={action_labels}, 风格={style_labels}")
+        except Exception as e:
+            print(f"[Utils] 加载标签失败: {e}，使用数字标签")
 
     plot_confusion_matrix(all_action_true, all_action_pred, action_labels,
                           "动作分类混淆矩阵", os.path.join(save_dir, "confusion_matrix_action.png"))

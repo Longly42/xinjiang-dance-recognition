@@ -1,5 +1,5 @@
 """
-thread_tools.py - 多线程工具类（高性能版 + 骨架提取与 ST-GCN 推理）
+thread_tools.py - 多线程工具类（高性能版 + 骨架提取与 ST-GCN 推理 + 骨架可视化）
 """
 
 import time
@@ -19,7 +19,7 @@ from utils.config import (
     SEQUENCE_LENGTH, INPUT_SIZE,
     RECORDING_DIR, SLICED_DIR,
     FPS_TARGET, FRAME_SKIP, ASYNC_INFERENCE,
-    LABEL_MAP_PATH          # 新增导入标签映射路径
+    LABEL_MAP_PATH
 )
 from utils.video_slicer import VideoSlicer
 
@@ -47,10 +47,8 @@ class MockInference:
             if os.path.exists(LABEL_MAP_PATH):
                 with open(LABEL_MAP_PATH, 'r', encoding='utf-8') as f:
                     label_map = json.load(f)
-                # label_map 格式: {"action": {"0":"扭颈动头", ...}, "style": {"0":"赛乃姆", ...}}
                 action_dict = label_map.get("action", {})
                 style_dict = label_map.get("style", {})
-                # 按索引顺序提取名称
                 self.actions = [action_dict[str(i)] for i in sorted(map(int, action_dict.keys()))]
                 self.styles = [style_dict[str(i)] for i in sorted(map(int, style_dict.keys()))]
                 print(f"[MockInference] 从 {LABEL_MAP_PATH} 加载标签: 动作 {len(self.actions)} 类, 风格 {len(self.styles)} 类")
@@ -58,9 +56,8 @@ class MockInference:
                 raise FileNotFoundError(f"标签文件不存在: {LABEL_MAP_PATH}")
         except Exception as e:
             print(f"[MockInference] 加载标签失败: {e}，使用默认标签")
-            # 回退默认标签（与任务书一致）
             self.actions = ["扭颈动头", "翻腕绕腕", "摆肩抖肩", "垫步进退", "叉腰摆胯", "击掌拍手", "旋转", "行礼", "抬臂托帽"]
-            self.styles = ["赛乃姆", "刀郎舞", "盘子舞", "萨玛舞", "夏地亚纳", "纳孜尔库姆"]
+            self.styles = ["赛乃姆", "刀郎舞", "盘子舞", "萨玛舞", "手鼓舞", "纳孜尔库姆"]
     
     def predict(self, frames: np.ndarray):
         """模拟推理，随机返回一个动作和风格"""
@@ -71,12 +68,13 @@ class MockInference:
 
 
 class CaptureThread(QThread):
-    """采集与推理线程（高性能优化版，集成骨架提取 + ST-GCN）"""
+    """采集与推理线程（高性能优化版，集成骨架提取 + ST-GCN + 骨架可视化）"""
 
     frame_ready = pyqtSignal(np.ndarray)
     result_ready = pyqtSignal(str, str, float)
     status_updated = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
+    skeleton_ready = pyqtSignal(bool, int)  # 新增：骨架检测状态信号 (是否检测到, 关键点数量)
 
     def __init__(self, source_type="screen", source_param=None):
         super().__init__()
@@ -119,6 +117,10 @@ class CaptureThread(QThread):
         self.last_inference_time = 0
         self.inference_interval = 0.5  # 每0.5秒推理一次
 
+        # 骨架可视化相关
+        self.current_poses = None
+        self.current_poses_lock = threading.Lock()
+
         # 性能统计
         self.fps = 0
         self.frame_count = 0
@@ -137,6 +139,11 @@ class CaptureThread(QThread):
                 self.capturer = ScreenCapture()
         elif self.source_type == "video":
             self.capturer = VideoCapture(self.source_param)
+
+    def get_current_poses(self):
+        """获取当前骨架数据（供 GUI 绘制）"""
+        with self.current_poses_lock:
+            return self.current_poses.copy() if self.current_poses is not None else None
 
     def run(self):
         self.running = True
@@ -244,16 +251,33 @@ class CaptureThread(QThread):
             if self.use_mock:
                 frames_array = np.array(frames_list)
                 action, style, confidence = self.inference.predict(frames_array)
+                # Mock 模式没有骨架数据
+                with self.current_poses_lock:
+                    self.current_poses = None
+                self.skeleton_ready.emit(False, 0)
             else:
                 # 真实模型：先提取骨架
                 if self.pose_extractor is None or self.recognizer is None:
                     return
+                
+                # 提取骨架序列
                 poses = self.pose_extractor.extract_sequence(frames_list)
-                if poses is None:
-                    # 未检测到人体，跳过本次推理
+                
+                # 更新当前骨架数据（供可视化）
+                if poses is not None and len(poses) > 0:
+                    with self.current_poses_lock:
+                        self.current_poses = poses[-1]  # 保存最后一帧骨架
+                    # 统计可见关键点数量（visibility > 0.5）
+                    visible_keypoints = np.sum(poses[-1][:, 2] > 0.5) if len(poses[-1]) > 0 else 0
+                    self.skeleton_ready.emit(True, visible_keypoints)
+                else:
+                    with self.current_poses_lock:
+                        self.current_poses = None
+                    self.skeleton_ready.emit(False, 0)
                     return
+                
                 action, style, confidence = self.recognizer.predict_from_poses(poses)
-
+            
             self.result_ready.emit(action, style, confidence)
         except Exception as e:
             self.error_occurred.emit(f"推理失败: {e}")
@@ -265,13 +289,28 @@ class CaptureThread(QThread):
             if self.use_mock:
                 frames_array = np.array(frames_list)
                 action, style, confidence = self.inference.predict(frames_array)
+                with self.current_poses_lock:
+                    self.current_poses = None
+                self.skeleton_ready.emit(False, 0)
             else:
                 if self.pose_extractor is None or self.recognizer is None:
                     return
+                
                 poses = self.pose_extractor.extract_sequence(frames_list)
-                if poses is None:
+                
+                if poses is not None and len(poses) > 0:
+                    with self.current_poses_lock:
+                        self.current_poses = poses[-1]
+                    visible_keypoints = np.sum(poses[-1][:, 2] > 0.5) if len(poses[-1]) > 0 else 0
+                    self.skeleton_ready.emit(True, visible_keypoints)
+                else:
+                    with self.current_poses_lock:
+                        self.current_poses = None
+                    self.skeleton_ready.emit(False, 0)
                     return
+                
                 action, style, confidence = self.recognizer.predict_from_poses(poses)
+            
             self.result_ready.emit(action, style, confidence)
         except Exception as e:
             self.error_occurred.emit(f"推理失败: {e}")
@@ -279,23 +318,18 @@ class CaptureThread(QThread):
     def stop(self):
         self.running = False
         self.wait()
-
+        # 释放 MediaPipe 资源
+        if self.pose_extractor:
+            self.pose_extractor.release()
+        
     def pause(self):
         self.paused = True
 
     def resume(self):
         self.paused = False
-        
-    def stop(self):
-        self.running = False
-        self.wait()
-        # 释放 MediaPipe 资源
-        if self.pose_extractor:
-            self.pose_extractor.release()
 
 
-# ---------- RecordingThread 和 DatasetBuildThread 保持不变 ----------
-# （以下代码与之前相同，为完整起见也列出，但实际未改动）
+# ==================== RecordingThread ====================
 
 class RecordingThread(QThread):
     """录屏线程（优化版）"""
@@ -374,6 +408,8 @@ class RecordingThread(QThread):
         self.wait()
 
 
+# ==================== DatasetBuildThread ====================
+
 class DatasetBuildThread(QThread):
     """数据集构建线程（骨架提取专用，用于从录制视频构建数据集）"""
 
@@ -434,7 +470,6 @@ class DatasetBuildThread(QThread):
                     poses = pose_extractor.extract_sequence(frames[:SEQUENCE_LENGTH])
                     if poses is not None:
                         all_poses.append(poses)
-                        # 无标签，暂时填0
                         all_action_labels.append(0)
                         all_style_labels.append(0)
 

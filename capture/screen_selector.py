@@ -1,5 +1,6 @@
 """
-screen_selector.py - 屏幕区域选择器（使用 QDialog 模态，可靠拖拽）
+screen_selector.py - 屏幕区域选择器（修复高DPI坐标问题）
+使用 QScreen 获取物理像素坐标，确保选区与截屏一致
 """
 
 import sys
@@ -7,43 +8,54 @@ from PyQt6.QtWidgets import (
     QDialog, QRubberBand, QApplication, QLabel
 )
 from PyQt6.QtCore import Qt, QRect, QPoint, QTimer
-from PyQt6.QtGui import QPainter, QColor, QBrush
+from PyQt6.QtGui import QPainter, QColor, QBrush, QGuiApplication
 
 
 class ScreenSelector(QDialog):
-    """全屏区域选择器（模态对话框）"""
+    """全屏区域选择器 - 修复高DPI坐标问题"""
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        
+        # 设置透明背景
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        
         # 无边框、置顶
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.WindowStaysOnTopHint
         )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         
-        # 获取所有屏幕的总体几何区域
-        self.screen_geometry = self.get_full_screen_geometry()
+        # 获取所有屏幕的物理几何区域
+        self.screen_geometry = self.get_physical_screen_geometry()
         self.setGeometry(self.screen_geometry)
         
         # 橡胶框（选区拖拽框）
         self.rubber_band = QRubberBand(QRubberBand.Shape.Rectangle, self)
         self.origin = QPoint()
-        self.is_dragging = False      # 是否真正拖拽（区别于单击）
-        self.selected_rect = None     # 最终选择的矩形
+        self.is_dragging = False
+        self.selected_rect = None
         
         # 顶部提示标签
         self.setup_hint_label()
+        
+        # 显示窗口
+        self.showFullScreen()
     
-    def get_full_screen_geometry(self):
-        """获取所有屏幕的总区域（支持多显示器）"""
-        screens = QApplication.screens()
+    def get_physical_screen_geometry(self) -> QRect:
+        """
+        获取所有屏幕的物理像素几何区域
+        关键：使用 QGuiApplication.screens() 获取真实物理坐标
+        """
+        screens = QGuiApplication.screens()
         if not screens:
             return QRect(0, 0, 1920, 1080)
+        
         min_x = min(s.geometry().x() for s in screens)
         min_y = min(s.geometry().y() for s in screens)
         max_x = max(s.geometry().x() + s.geometry().width() for s in screens)
         max_y = max(s.geometry().y() + s.geometry().height() for s in screens)
+        
         return QRect(min_x, min_y, max_x - min_x, max_y - min_y)
     
     def setup_hint_label(self):
@@ -81,10 +93,10 @@ class ScreenSelector(QDialog):
         if event.button() == Qt.MouseButton.LeftButton:
             self.origin = event.pos()
             self.is_dragging = False
-            self.selected_rect = None          # 清除之前选区
+            self.selected_rect = None
             self.rubber_band.setGeometry(QRect(self.origin, self.origin))
             self.rubber_band.show()
-            self.update()                       # 重绘清除之前的选区效果
+            self.update()
     
     def mouseMoveEvent(self, event):
         if event.buttons() & Qt.MouseButton.LeftButton:
@@ -108,12 +120,12 @@ class ScreenSelector(QDialog):
             if final_rect.width() < min_size or final_rect.height() < min_size:
                 self.hint_label.setText("选区太小，请重新拖拽（至少10×10像素）")
                 QTimer.singleShot(1500, self.restore_hint)
-                self.is_dragging = False   # 重置拖拽标志，等待下一次
+                self.is_dragging = False
                 return
             
             # 情况3：有效选区
             self.selected_rect = final_rect
-            self.update()   # 立即重绘，显示挖空效果
+            self.update()
             # 延迟关闭，让用户看清选区
             QTimer.singleShot(500, self.accept)
     
@@ -124,32 +136,66 @@ class ScreenSelector(QDialog):
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
             self.selected_rect = None
-            self.reject()   # 取消关闭
+            self.reject()
+    
+    # ========== 新增：逻辑坐标转物理坐标 ==========
+    def logical_to_physical_rect(self, rect: QRect) -> tuple:
+        """
+        将逻辑坐标矩形转换为物理像素坐标。
+        解决高DPI缩放下选区偏移/缩放问题。
+        """
+        # 获取主屏幕（作为 fallback）
+        screen = QGuiApplication.primaryScreen()
+        if not screen:
+            # 没有屏幕信息时，直接返回原始坐标（按逻辑坐标处理）
+            return (rect.x(), rect.y(), rect.width(), rect.height())
+        
+        # 获取选区中心点所在的屏幕（支持多显示器不同缩放）
+        center = rect.center()
+        target_screen = QGuiApplication.screenAt(center)
+        if target_screen is None:
+            target_screen = screen
+        
+        dpr = target_screen.devicePixelRatio()
+        x = int(rect.x() * dpr)
+        y = int(rect.y() * dpr)
+        w = int(rect.width() * dpr)
+        h = int(rect.height() * dpr)
+        
+        print(f"[ScreenSelector] 坐标转换: 逻辑({rect.x()},{rect.y()},{rect.width()},{rect.height()}) -> "
+              f"物理({x},{y},{w},{h}) (dpr={dpr})")
+        return (x, y, w, h)
     
     def get_selected_area(self):
-        """返回 (x, y, width, height) 或 None"""
+        """
+        返回选区的**物理像素坐标** (x, y, width, height)
+        此坐标可直接用于 mss 截图。
+        """
         if self.selected_rect:
-            return (
-                self.selected_rect.x(),
-                self.selected_rect.y(),
-                self.selected_rect.width(),
-                self.selected_rect.height()
-            )
+            return self.logical_to_physical_rect(self.selected_rect)
         return None
 
 
 def select_screen_area():
     """
-    静态函数：打开全屏选区窗口，返回选区坐标或 None
-    使用模态对话框方式，不会引起事件循环嵌套问题
+    静态函数：打开全屏选区窗口，返回选区物理坐标或 None
     """
     app = QApplication.instance()
     if not app:
         app = QApplication(sys.argv)
     
     selector = ScreenSelector()
-    result = selector.exec()   # 模态运行
+    result = selector.exec()
+    
     if result == QDialog.DialogCode.Accepted:
         return selector.get_selected_area()
     else:
         return None
+
+
+# 测试入口
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    area = select_screen_area()
+    print(f"选择的物理区域: {area}")
+    sys.exit(0)

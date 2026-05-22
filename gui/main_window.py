@@ -1,15 +1,17 @@
 """
-main_window.py - 主窗口（完整版包含录屏模式）
+main_window.py - 主窗口（带实时骨架可视化）
 """
 
 import sys
+import cv2
+import numpy as np
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QGroupBox, QStatusBar,
-    QFileDialog, QComboBox, QProgressBar, QMessageBox
+    QFileDialog, QComboBox, QProgressBar, QMessageBox, QCheckBox
 )
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QFont, QImage, QPixmap
+from PyQt6.QtGui import QFont, QImage, QPixmap, QPainter, QPen, QColor
 
 from gui.ui_settings import (
     MAIN_WINDOW_SIZE, PREVIEW_SIZE,
@@ -19,11 +21,11 @@ from utils.thread_tools import CaptureThread, RecordingThread, DatasetBuildThrea
 
 
 class MainWindow(QMainWindow):
-    """新疆舞动作识别主窗口（多线程版 + 录屏模式）"""
+    """新疆舞动作识别主窗口（带骨架可视化）"""
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("新疆舞多风格细粒度动作识别")
+        self.setWindowTitle("新疆舞多风格细粒度动作识别 - 骨架可视化版")
         self.resize(*MAIN_WINDOW_SIZE)
         
         # 初始化变量
@@ -33,6 +35,9 @@ class MainWindow(QMainWindow):
         self.capture_thread = None
         self.recording_thread = None
         self.dataset_thread = None
+        
+        # 骨架可视化开关
+        self.show_skeleton = True  # 默认开启
         
         # 设置UI布局
         self.setup_ui()
@@ -99,6 +104,13 @@ class MainWindow(QMainWindow):
         self.mode_combo.setFixedWidth(120)
         bar_layout.addWidget(self.mode_combo)
         
+        # 骨架可视化开关
+        self.skeleton_checkbox = QCheckBox("🦴 显示骨架")
+        self.skeleton_checkbox.setChecked(True)
+        self.skeleton_checkbox.setFont(QFont(*FONTS["button"]))
+        self.skeleton_checkbox.stateChanged.connect(self.on_skeleton_toggle)
+        bar_layout.addWidget(self.skeleton_checkbox)
+        
         # 按钮1：选择屏幕区域
         self.btn_select_area = QPushButton(BTN_TEXT["select_area"])
         self.btn_select_area.clicked.connect(self.on_select_area)
@@ -126,6 +138,11 @@ class MainWindow(QMainWindow):
         bar_layout.addWidget(self.btn_load_video)
         
         return bar_widget
+    
+    def on_skeleton_toggle(self, state):
+        """骨架可视化开关"""
+        self.show_skeleton = (state == Qt.CheckState.Checked.value)
+        self.update_status(f"骨架可视化: {'开启' if self.show_skeleton else '关闭'}")
     
     def create_preview_label(self):
         label = QLabel()
@@ -187,6 +204,15 @@ class MainWindow(QMainWindow):
         fps_layout.addWidget(self.fps_label)
         panel_layout.addWidget(fps_group)
         
+        # 骨架信息
+        skeleton_group = QGroupBox("🦴 骨架检测")
+        skeleton_layout = QVBoxLayout(skeleton_group)
+        self.skeleton_status = QLabel("等待检测...")
+        self.skeleton_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.skeleton_status.setFont(QFont("微软雅黑", 10))
+        skeleton_layout.addWidget(self.skeleton_status)
+        panel_layout.addWidget(skeleton_group)
+        
         panel_layout.addStretch()
         return panel
     
@@ -194,7 +220,7 @@ class MainWindow(QMainWindow):
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.setFont(QFont(*FONTS["status"]))
-        self.update_status("就绪 | 请选择模式并框选区域")
+        self.update_status("就绪 | 请选择模式并框选区域 | 骨架可视化已开启")
     
     # ==================== 按钮槽函数 ====================
     
@@ -239,7 +265,7 @@ class MainWindow(QMainWindow):
         
         if mode == "📹 录屏模式":
             self.start_recording()
-        else:  # 识别模式
+        else:
             self.start_recognition()
     
     def start_recognition(self):
@@ -266,10 +292,20 @@ class MainWindow(QMainWindow):
         self.capture_thread.result_ready.connect(self.update_result_display)
         self.capture_thread.status_updated.connect(self.update_fps_display)
         self.capture_thread.error_occurred.connect(self.on_thread_error)
+        self.capture_thread.skeleton_ready.connect(self.update_skeleton_status)
         self.capture_thread.start()
         
         self._set_running_state(True)
         self.update_status("正在识别新疆舞动作...")
+    
+    def update_skeleton_status(self, has_skeleton, keypoints_count):
+        """更新骨架检测状态"""
+        if has_skeleton:
+            self.skeleton_status.setText(f"✅ 检测到人体 ({keypoints_count} 关键点)")
+            self.skeleton_status.setStyleSheet(f"color: {COLORS['success']};")
+        else:
+            self.skeleton_status.setText("⚠️ 未检测到人体")
+            self.skeleton_status.setStyleSheet(f"color: {COLORS['warning']};")
     
     def start_recording(self):
         if not self.selected_area:
@@ -284,7 +320,7 @@ class MainWindow(QMainWindow):
         self.recording_thread.finished.connect(self.on_recording_finished)
         self.recording_thread.error_occurred.connect(self.on_thread_error)
         self.recording_thread.progress_updated.connect(self.on_recording_progress)
-        self.recording_thread.frame_ready.connect(self.update_preview)  # 添加这一行：连接预览信号
+        self.recording_thread.frame_ready.connect(self.update_preview)
         
         self.recording_thread.start()
         
@@ -296,7 +332,6 @@ class MainWindow(QMainWindow):
     def on_recording_finished(self, video_path):
         self.update_status(f"录制完成: {video_path}")
         
-        # 询问是否自动构建数据集
         reply = QMessageBox.question(
             self, "数据集构建",
             f"录制完成！是否自动切分视频并提取骨架特征？\n\n视频路径: {video_path}",
@@ -313,7 +348,6 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(percent)
     
     def build_dataset_from_video(self, video_path):
-        """从录制的视频构建数据集"""
         self.dataset_thread = DatasetBuildThread(video_path)
         self.dataset_thread.status_updated.connect(self.update_status)
         self.dataset_thread.finished.connect(self.on_dataset_built)
@@ -387,11 +421,19 @@ class MainWindow(QMainWindow):
             self.style_label.setText("未识别")
             self.confidence_label.setText("0%")
             self.fps_label.setText("未开始")
+            self.skeleton_status.setText("等待检测...")
     
     # ==================== 信号槽函数 ====================
     
     def update_preview(self, frame):
+        """更新预览画面（带骨架绘制）"""
         try:
+            # 如果需要显示骨架，在帧上绘制
+            if self.show_skeleton and hasattr(self.capture_thread, 'get_current_poses'):
+                poses = self.capture_thread.get_current_poses()
+                if poses is not None:
+                    frame = self.draw_skeleton_on_frame(frame, poses)
+            
             h, w, ch = frame.shape
             bytes_per_line = ch * w
             qt_image = QImage(frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
@@ -404,6 +446,73 @@ class MainWindow(QMainWindow):
             self.preview_label.setPixmap(scaled_pixmap)
         except Exception as e:
             pass
+    
+    def draw_skeleton_on_frame(self, frame, poses):
+        """
+        在帧上绘制骨架
+        poses: (33, 3) 关键点数组 (x, y, visibility)
+        """
+        h, w = frame.shape[:2]
+        
+        # MediaPipe 33个关键点的连接关系
+        skeleton_connections = [
+            # 面部
+            (0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8),
+            # 躯干
+            (9, 10), (11, 12), (11, 23), (12, 24), (23, 24),
+            # 左臂
+            (11, 13), (13, 15), (15, 17), (15, 19), (15, 21),
+            # 右臂
+            (12, 14), (14, 16), (16, 18), (16, 20), (16, 22),
+            # 左腿
+            (23, 25), (25, 27), (27, 29), (27, 31),
+            # 右腿
+            (24, 26), (26, 28), (28, 30), (28, 32)
+        ]
+        
+        # 转换为像素坐标
+        points = []
+        for i, pose in enumerate(poses):
+            if i >= 33:
+                break
+            x = int(pose[0] * w)
+            y = int(pose[1] * h)
+            visibility = pose[2] if len(pose) > 2 else 1.0
+            
+            # 只显示可见度 > 0.5 的关键点
+            if visibility > 0.5:
+                points.append((x, y, visibility))
+            else:
+                points.append((0, 0, 0))
+        
+        # 绘制骨架连接（线条）
+        for connection in skeleton_connections:
+            p1_idx, p2_idx = connection
+            if p1_idx < len(points) and p2_idx < len(points):
+                p1 = points[p1_idx]
+                p2 = points[p2_idx]
+                if p1[2] > 0.5 and p2[2] > 0.5:  # 两点都可见
+                    cv2.line(frame, (p1[0], p1[1]), (p2[0], p2[1]), 
+                            (0, 255, 0), 2)  # 绿色线条
+        
+        # 绘制关键点（圆圈）
+        for i, (x, y, vis) in enumerate(points):
+            if vis > 0.5:
+                # 不同部位不同颜色
+                if i in [0, 1, 2, 3, 4, 5, 6, 7, 8]:  # 头部
+                    color = (0, 0, 255)  # 红色
+                    radius = 4
+                elif i in [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]:  # 四肢
+                    color = (255, 255, 0)  # 青色
+                    radius = 3
+                else:  # 躯干
+                    color = (0, 255, 255)  # 黄色
+                    radius = 3
+                
+                cv2.circle(frame, (x, y), radius, color, -1)
+                cv2.circle(frame, (x, y), radius, (255, 255, 255), 1)
+        
+        return frame
     
     def update_result_display(self, action: str, style: str, confidence: float):
         self.action_label.setText(action)
@@ -430,6 +539,9 @@ class MainWindow(QMainWindow):
             else:
                 if self.selected_area or self.loaded_video_path:
                     self.on_start()
+        elif event.key() == Qt.Key.Key_S:
+            # 快捷键 S 切换骨架显示
+            self.skeleton_checkbox.setChecked(not self.skeleton_checkbox.isChecked())
         elif event.key() == Qt.Key.Key_Escape:
             if self.is_running:
                 self.on_stop()

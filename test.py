@@ -6,10 +6,10 @@ import os
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose()
 
-video_path = r"data\to_text\刀郎舞02.mp4"
+video_path = r"data\recordings\刀郎舞01_slice0000_0_40.mp4"
 
 # 设置图片保存路径
-save_dir = r"data\to_text\jpg"
+save_dir = r"data\recordings\jpg"
 if not os.path.exists(save_dir):
     os.makedirs(save_dir)
     print(f"📁 已创建文件夹: {save_dir}")
