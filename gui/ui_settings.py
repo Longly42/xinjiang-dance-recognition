@@ -35,6 +35,11 @@ COLORS = {
     # 边框与分隔
     "border": "#3c3c3c",            # 边框颜色
     "separator": "#2a2a2a",         # 分隔线颜色
+
+    # 在 COLORS 字典中添加
+    "success_light": "#8bc34a",
+    "warning_light": "#ffb74d",
+    "error_light": "#ef9a9a",
 }
 
 # ==================== 字体 ====================

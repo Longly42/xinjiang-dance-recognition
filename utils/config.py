@@ -1,14 +1,14 @@
 """
-配置文件 - 性能优化版
+配置文件 - 统一使用 st_data 目录，时序长度 64 帧
 """
 
 import os
 
 # ==================== 输入输出约定 ====================
-# 优化：降低输入尺寸，提升帧率
-INPUT_SIZE = (480, 360)          # 原 (640, 480)，计算量减少约 44%
-SEQUENCE_LENGTH = 16             # 时序长度（不变）
-FPS_TARGET = 20                  # 目标采集帧率（原30）
+# 统一为64帧（与st_model保持一致）
+INPUT_SIZE = (480, 360)          # 输入尺寸
+SEQUENCE_LENGTH = 64             # 时序长度（64帧）
+FPS_TARGET = 15                  # 目标采集帧率（64帧约4.3秒缓存）
 
 # 性能优化参数
 USE_FAST_RESIZE = True           # 使用快速缩放
@@ -20,11 +20,8 @@ CACHE_COLOR_CONVERSION = True    # 缓存颜色转换结果
 NUM_KEYPOINTS = 33
 KEYPOINT_FEATURE_DIM = 3
 
-# ==================== 标签映射已移至 data/keypoints/label_map.json ====================
-# 不再在代码中硬编码，统一从 JSON 文件读取
-
-# ==================== 数据路径 ====================
-DATA_ROOT = "./data"
+# ==================== 数据路径（统一使用 st_data）====================
+DATA_ROOT = "./st_data"                    # 数据根目录改为 st_data
 RECORDING_DIR = os.path.join(DATA_ROOT, "recordings")
 SLICED_DIR = os.path.join(DATA_ROOT, "sliced_clips")
 KEYPOINTS_DIR = os.path.join(DATA_ROOT, "keypoints")
